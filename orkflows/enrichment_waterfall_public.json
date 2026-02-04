@@ -1,0 +1,314 @@
+{
+  "name": "Enrichment Waterfall [public]",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/enrich",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-576, -576],
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "import re\nimport unicodedata\n\nresults = []\n\nfor item in items:\n    companies = item.json.get('body', {}).get('companies', [])\n\n    for name in companies:\n        clean = name.strip()\n        noise_pattern = r'\\b(ltda|s\\.?a\\.?|s/a|me|epp|llc|inc|corp|group|grupo|servicos|consultoria)\\b'\n        base_name = re.sub(noise_pattern, '', clean, flags=re.IGNORECASE).strip()\n\n        nfkd_form = unicodedata.normalize('NFKD', base_name)\n        no_accents = \"\".join([c for c in nfkd_form if not unicodedata.combining(c)])\n\n        search_name = re.sub(r'[^\\w\\s]', '', no_accents).strip()\n\n        snake_case = search_name.lower().replace(' ', '_')\n        snake_case = re.sub(r'_+', '_', snake_case).strip('_')\n\n        results.append({\n            \"json\": {\n                \"original\": name,\n                \"search_name\": search_name,\n                \"fallback_name\": snake_case\n            }\n        })\n\nreturn results"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-400, -576],
+      "name": "Normalize input"
+    },
+    {
+      "parameters": { "options": {} },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-192, -384],
+      "name": "Batches"
+    },
+    {
+      "parameters": {
+        "url": "https://api.apollo.io/api/v1/organizations/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Cache-Control", "value": "no-cache" },
+            { "name": "X-Api-Key", "value": "{{APOLLO_API_KEY}}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "q_organization_name", "value": "={{ $json.search_name }}" },
+            { "name": "page", "value": "1" },
+            { "name": "per_page", "value": "5" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [32, -384],
+      "name": "Apollo"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.pagination.total_entries }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [192, -384],
+      "name": "If (Apollo empty?)"
+    },
+    {
+      "parameters": {
+        "url": "https://api.apollo.io/api/v1/organizations/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Cache-Control", "value": "no-cache" },
+            { "name": "X-Api-Key", "value": "{{APOLLO_API_KEY}}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "q_organization_name", "value": "={{ $('Normalize input').item.json.fallback_name }}" },
+            { "name": "page", "value": "1" },
+            { "name": "per_page", "value": "5" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [368, -560],
+      "name": "Apollo (fallback snake)"
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "results = []\n\nfor item in items:\n    orgs = item.json.get('organizations', [])\n    target_domain = (item.json.get('searched_domain') or \"\").lower()\n\n    if not orgs:\n        item.json = {\"match\": None, \"found\": False}\n    else:\n        def get_priority(org):\n            score = 0\n            domain = (org.get('primary_domain') or \"\").lower()\n\n            if target_domain and domain == target_domain:\n                score += 100\n\n            if org.get('prospect_status') == 'verified':\n                score += 20\n\n            if domain:\n                score += 10\n            if org.get('linkedin_url'):\n                score += 10\n\n            emp_count = org.get('estimated_num_employees', 0) or 0\n            if emp_count > 1000:\n                score += 5\n            elif emp_count > 50:\n                score += 2\n\n            return score\n\n        sorted_orgs = sorted(orgs, key=get_priority, reverse=True)\n\n        item.json = {\n            \"match\": sorted_orgs[0],\n            \"score\": get_priority(sorted_orgs[0]),\n            \"found\": True\n        }\n\n    results.append(item)\n\nreturn results"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, -368],
+      "name": "Pick best org (Apollo)"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.match }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [720, -368],
+      "name": "If (Apollo match?)"
+    },
+    {
+      "parameters": {
+        "url": "https://serpapi.com/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "q", "value": "=CNPJ de {{ $json.match.name }}" },
+            { "name": "engine", "value": "google" },
+            { "name": "gl", "value": "br" },
+            { "name": "api_key", "value": "{{SERPAPI_KEY}}" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [912, -384],
+      "name": "Google (SerpAPI)"
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "import re\n\nresults = []\n\nfor item in items:\n    organic = item.json.get('organic_results', [])\n    found_cnpj = None\n\n    for result in organic:\n        text = result.get('snippet', '') or ''\n        match = re.search(r'\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2}', text)\n        if match:\n            found_cnpj = match.group(0)\n            break\n\n    if found_cnpj:\n        cnpj_only_numbers = re.sub(r'\\D', '', found_cnpj)\n        item.json = {\n            \"cnpj_formatado\": found_cnpj,\n            \"cnpj_limpo\": cnpj_only_numbers,\n            \"source\": \"google_snippet\",\n            \"status\": \"success\"\n        }\n    else:\n        item.json = {\n            \"status\": \"not_found\",\n            \"message\": \"CNPJ not visible in Google snippets\"\n        }\n\n    results.append(item)\n\nreturn results"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1072, -384],
+      "name": "Extract CNPJ"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "not_found",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [1248, -384],
+      "name": "If (CNPJ found?)"
+    },
+    {
+      "parameters": {
+        "url": "=https://brasilapi.com.br/api/cnpj/v1/{{ $json.cnpj_limpo }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [1408, -400],
+      "name": "BrasilAPI (CNPJ)"
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = [];\n\nfor (const item of items) {\n  const qsa = item.json.qsa ?? [];\n\n  let decisor = qsa.find(s => s.qualificacao_socio === 'Administrador') ?? qsa[0] ?? null;\n  const nomeCompleto = decisor?.nome_socio?.toLowerCase().trim() ?? '';\n\n  const dominio =\n    $('Pick best org (Apollo)')?.item?.json?.match?.primary_domain ??\n    item.json.domain ??\n    '';\n\n  let email1 = 'N/A', email2 = 'N/A', email3 = 'N/A';\n\n  if (nomeCompleto && dominio) {\n    const partes = nomeCompleto.split(' ').filter(Boolean);\n    const primeiro = partes[0];\n    const ultimo = partes.length > 1 ? partes[partes.length - 1] : '';\n\n    email1 = `${primeiro}@${dominio}`;\n    email2 = ultimo ? `${primeiro}.${ultimo}@${dominio}` : email1;\n    email3 = ultimo ? `${primeiro[0]}${ultimo}@${dominio}` : `${primeiro[0]}@${dominio}`;\n  }\n\n  item.json.sheet_empresa = item.json.razao_social ?? 'N/A';\n  item.json.sheet_cnpj = item.json.cnpj ?? 'N/A';\n  item.json.sheet_capital = item.json.capital_social ?? 0;\n  item.json.sheet_decisor = nomeCompleto ? nomeCompleto.toUpperCase() : 'N/A';\n  item.json.sheet_email_1 = email1;\n  item.json.sheet_email_2 = email2;\n  item.json.sheet_email_3 = email3;\n  item.json.sheet_socios_todos = qsa.map(s => s.nome_socio).filter(Boolean).join(', ');\n  item.json.sheet_status = 'Ready';\n\n  results.push(item);\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1568, -400],
+      "name": "Standardize output"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "name": "Company Name", "value": "={{ $('Pick best org (Apollo)').item.json.match.name }}", "type": "string" },
+            { "name": "Legal Name", "value": "={{ $json.razao_social }}", "type": "string" },
+            { "name": "CNPJ (formatted)", "value": "={{ $('Extract CNPJ').item.json.cnpj_formatado }}", "type": "string" },
+            { "name": "CNPJ", "value": "={{ $json.cnpj }}", "type": "string" },
+            { "name": "CNAE", "value": "={{ $json.cnae_fiscal_descricao }}", "type": "string" },
+            { "name": "CNAE Code", "value": "={{ $json.cnae_fiscal }}", "type": "number" },
+            { "name": "Capital", "value": "={{ $json.capital_social }}", "type": "number" },
+            { "name": "Country", "value": "={{ $('Pick best org (Apollo)').item.json.match.country }}", "type": "string" },
+            { "name": "State", "value": "={{ $json.uf }}", "type": "string" },
+            { "name": "City", "value": "={{ $json.municipio }}", "type": "string" },
+            { "name": "Domain", "value": "={{ $('Pick best org (Apollo)').item.json.match.primary_domain }}", "type": "string" },
+            { "name": "Website", "value": "={{ $('Pick best org (Apollo)').item.json.match.website_url }}", "type": "string" },
+            { "name": "LinkedIn", "value": "={{ $('Pick best org (Apollo)').item.json.match.linkedin_url }}", "type": "string" },
+            { "name": "Logo", "value": "={{ $('Pick best org (Apollo)').item.json.match.logo_url }}", "type": "string" },
+            { "name": "Industries", "value": "={{ $('Pick best org (Apollo)').item.json.match.industries }}", "type": "array" },
+            { "name": "Decision Maker", "value": "={{ $json.sheet_decisor }}", "type": "string" },
+            { "name": "Email 1", "value": "={{ $json.sheet_email_1 }}", "type": "string" },
+            { "name": "Email 2", "value": "={{ $json.sheet_email_2 }}", "type": "string" },
+            { "name": "Email 3", "value": "={{ $json.sheet_email_3 }}", "type": "string" },
+            { "name": "Partners", "value": "={{ $json.sheet_socios_todos }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1712, -400],
+      "name": "Dataset"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "name": "Company Name", "value": "={{ $('Normalize input').item.json.original }}", "type": "string" },
+            { "name": "Status", "value": "=Not found", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1408, -176],
+      "name": "Dataset (not found)"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [32, -576],
+      "name": "Respond to Webhook"
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Normalize input", "type": "main", "index": 0 }]] },
+    "Normalize input": { "main": [[{ "node": "Batches", "type": "main", "index": 0 }]] },
+    "Batches": {
+      "main": [
+        [{ "node": "Respond to Webhook", "type": "main", "index": 0 }],
+        [{ "node": "Apollo", "type": "main", "index": 0 }]
+      ]
+    },
+    "Apollo": { "main": [[{ "node": "If (Apollo empty?)", "type": "main", "index": 0 }]] },
+    "If (Apollo empty?)": {
+      "main": [
+        [{ "node": "Apollo (fallback snake)", "type": "main", "index": 0 }],
+        [{ "node": "Pick best org (Apollo)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Apollo (fallback snake)": { "main": [[{ "node": "Pick best org (Apollo)", "type": "main", "index": 0 }]] },
+    "Pick best org (Apollo)": { "main": [[{ "node": "If (Apollo match?)", "type": "main", "index": 0 }]] },
+    "If (Apollo match?)": {
+      "main": [
+        [{ "node": "Google (SerpAPI)", "type": "main", "index": 0 }],
+        [{ "node": "Batches", "type": "main", "index": 0 }]
+      ]
+    },
+    "Google (SerpAPI)": { "main": [[{ "node": "Extract CNPJ", "type": "main", "index": 0 }]] },
+    "Extract CNPJ": { "main": [[{ "node": "If (CNPJ found?)", "type": "main", "index": 0 }]] },
+    "If (CNPJ found?)": {
+      "main": [
+        [{ "node": "BrasilAPI (CNPJ)", "type": "main", "index": 0 }],
+        [{ "node": "Dataset (not found)", "type": "main", "index": 0 }]
+      ]
+    },
+    "BrasilAPI (CNPJ)": { "main": [[{ "node": "Standardize output", "type": "main", "index": 0 }]] },
+    "Standardize output": { "main": [[{ "node": "Dataset", "type": "main", "index": 0 }]] },
+    "Dataset": { "main": [[{ "node": "Batches", "type": "main", "index": 0 }]] },
+    "Dataset (not found)": { "main": [[{ "node": "Batches", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "tags": []
+}
